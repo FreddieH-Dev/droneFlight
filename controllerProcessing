@@ -1,0 +1,217 @@
+//ESP32 CONTROLLER CODE//
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// UNO MAC Address
+uint8_t DroneMacAddress[6] = {0xB4, 0xE6, 0x2D, 0x4A, 0x10, 0x45};
+
+int joystickY_pin = A3;    // Analog pin for joystick Y-axis (pitch control)
+int joystickX_pin = A2;    // Analog pin for joystick X-axis (roll control)
+#define BUTTON1       2    // Arm/disarm toggle button
+#define BUTTONLEFT    6    // Left rotation (yaw left)
+#define BUTTONRIGHT   5    // Right rotation (yaw right)
+#define LED1          3    // Status LED (on = armed, off = disarmed)
+int potentiometre_pin = A5; // Throttle control potentiometer
+
+int centerX = 512; // default mid-point (0–1023)
+int centerY = 512;
+float joyX_smooth = 127;
+float joyY_smooth = 127;
+
+uint8_t joystickX_value = 127; // centred
+uint8_t joystickY_value = 127; // centred
+uint8_t throttle = 0;
+uint8_t lockedMotors = 1;
+uint8_t rotateLeft = 0;
+uint8_t rotateRight = 0;
+
+int deadzone = 10;         // raw ADC deadzone (~2% of 1023)
+float maxTilt = 25.0;      // max % adjustment per axis
+int motorSpeed = 0;        // base motor speed
+
+uint8_t frontLeft = 0;
+uint8_t frontRight = 0;
+uint8_t backLeft = 0;
+uint8_t backRight = 0;
+
+int count = 1;
+unsigned long lastButtonPress = 0;
+const unsigned long DEBOUNCE_DELAY = 200;
+
+int number = 0;
+
+struct Packet {
+  uint8_t number;
+  uint8_t frontLeft;
+  uint8_t frontRight;
+  uint8_t backLeft;
+  uint8_t backRight;
+};
+
+Packet dataToSend;
+
+unsigned long lastSendTime = 0;
+const unsigned long SEND_INTERVAL = 20;
+
+
+void setup() {
+  Serial.begin(250000);
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != 0) {
+    Serial.println("ESP-NOW init failed!");
+    while (1);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, DroneMacAddress, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Peer add failed");
+    while (true);
+  } else {
+    Serial.println("eer added - Motor control active");
+  }
+
+  pinMode(BUTTON1, INPUT_PULLUP);
+  pinMode(BUTTONLEFT, INPUT_PULLUP);
+  pinMode(BUTTONRIGHT, INPUT_PULLUP);
+  pinMode(LED1, OUTPUT);
+
+  delay(500); // let ADC settle
+  centerX = analogRead(joystickX_pin);
+  centerY = analogRead(joystickY_pin);
+  Serial.printf("Joystick calibrated: centerX=%d, centerY=%d\n", centerX, centerY);
+
+  Serial.println("ESP32 Flight Controller Ready");
+}
+
+void sensorRead() {
+  // Read raw joystick values
+  int rawX = analogRead(joystickX_pin);
+  int rawY = analogRead(joystickY_pin);
+
+  // Apply raw deadzone
+  if (abs(rawX - centerX) < deadzone) rawX = centerX;
+  if (abs(rawY - centerY) < deadzone) rawY = centerY;
+
+  // Shift so centre is 127
+  int shiftedX = constrain((rawX - centerX) + 512, 0, 1023) / 4;
+  int shiftedY = constrain((rawY - centerY) + 512, 0, 1023) / 4;
+
+  // Smooth inputs (EMA filter)
+  joyX_smooth = joyX_smooth * 0.8 + shiftedX * 0.2;
+  joyY_smooth = joyY_smooth * 0.8 + shiftedY * 0.2;
+
+  joystickX_value = (uint8_t)joyX_smooth;
+  joystickY_value = (uint8_t)joyY_smooth;
+
+  // Throttle
+  int rawThrottle = analogRead(potentiometre_pin);
+  if (rawThrottle < 10) rawThrottle = 0;  // Bottom 2% deadzone
+  throttle = map(rawThrottle,0,4095,0,255);
+  //Serial.println(throttle);
+
+  // Rotation buttons
+  rotateLeft = (digitalRead(BUTTONLEFT) == LOW);
+  rotateRight = (digitalRead(BUTTONRIGHT) == LOW);
+}
+
+void handleButton() {
+  unsigned long currentTime = millis();
+
+  if (digitalRead(BUTTON1) == LOW &&
+      (currentTime - lastButtonPress) > DEBOUNCE_DELAY) {
+
+    count++;
+    if (count % 2 == 0) {
+      digitalWrite(LED1, HIGH);
+      lockedMotors = 0;
+      Serial.println("MOTORS ARMED");
+    } else {
+      digitalWrite(LED1, LOW);
+      lockedMotors = 1;
+      Serial.println("MOTORS DISARMED");
+    }
+    lastButtonPress = currentTime;
+  }
+}
+
+void motorCalculation() {
+  if (lockedMotors) {
+    frontLeft = frontRight = backLeft = backRight = 0;
+    return;
+  }
+
+  int throttle_mapped = map(throttle, 0, 255, 0, 85);
+  int joystickX_mapped = map(joystickX_value, 0, 255, -100, 100);
+  int joystickY_mapped = map(joystickY_value, 0, 255, -100, 100);
+
+  motorSpeed = 8 + throttle_mapped;
+
+  float xNorm = joystickX_mapped / 100.0;
+  float yNorm = joystickY_mapped / 100.0;
+
+  float xAdj = xNorm * maxTilt;
+  float yAdj = yNorm * maxTilt;
+
+  float yawAdj = 0;
+  if (rotateLeft) yawAdj = -15.0;
+  else if (rotateRight) yawAdj = 15.0;
+
+  //fron left anti-clockwise
+
+  float fl = motorSpeed + yAdj + xAdj - yawAdj;
+  float fr = motorSpeed + yAdj - xAdj + yawAdj;
+  float bl = motorSpeed - yAdj + xAdj - yawAdj;
+  float br = motorSpeed - yAdj - xAdj + yawAdj;
+
+  frontLeft = constrain((int)fl, 0, 100);
+  frontRight = constrain((int)fr, 0, 100);
+  backLeft = constrain((int)bl, 0, 100);
+  backRight = constrain((int)br, 0, 100);
+}
+
+void sendData() {
+  dataToSend.number = number;
+  dataToSend.frontLeft = frontLeft;
+  dataToSend.frontRight = frontRight;
+  dataToSend.backLeft = backLeft;
+  dataToSend.backRight = backRight;
+
+  esp_now_send(DroneMacAddress, (uint8_t*)&dataToSend, sizeof(Packet));
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 500) {
+    Serial.println(number);
+    number++;
+    if (millis() - lastPrint > 500) {
+      Serial.printf("Motors: %d %d %d %d | Thr=%d Arm=%d\n",
+                frontLeft, frontRight, backLeft, backRight,
+                throttle, !lockedMotors);
+  lastPrint = millis();
+}
+
+    lastPrint = millis();
+  }
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastSendTime >= SEND_INTERVAL) {
+    sensorRead();
+    handleButton();
+    motorCalculation();
+    sendData();
+    lastSendTime = currentTime;
+
+    /*Serial.print("Took:");
+    Serial.print(millis()-currentTime);
+    Serial.println("Seconds");*/
+  }
+}
