@@ -1,0 +1,175 @@
+// UNO: Fixed Motor Driver - No Calculations, Just Drive Motors
+#include <Servo.h>  // For ESC control
+
+struct Packet {
+  uint8_t number;
+  uint8_t frontLeft;
+  uint8_t frontRight;
+  uint8_t backLeft;
+  uint8_t backRight;
+};
+
+// ESC/Motor objects
+Servo escFL, escFR, escBL, escBR;
+
+// Motor pins - use PWM capable pins
+#define MOTOR_FL_PIN 10
+#define MOTOR_FR_PIN 5
+#define MOTOR_BL_PIN 11
+#define MOTOR_BR_PIN 6
+
+// Current motor commands
+Packet motorData;
+
+unsigned long lastValidPacket = 0;
+const unsigned long FAILSAFE_TIMEOUT = 2000; // 500ms timeout
+
+int number = 0;
+
+void initializeESCs() {
+  // Attach ESCs with standard range
+  escFL.attach(MOTOR_FL_PIN, 1000, 2000);
+  escFR.attach(MOTOR_FR_PIN, 1000, 2000);
+  escBL.attach(MOTOR_BL_PIN, 1000, 2000);
+  escBR.attach(MOTOR_BR_PIN, 1000, 2000);
+  
+  // Send max throttle for ESC initialization
+  escFL.writeMicroseconds(2000);
+  escFR.writeMicroseconds(2000);
+  escBL.writeMicroseconds(2000);
+  escBR.writeMicroseconds(2000);
+  delay(3000);
+
+  escFL.writeMicroseconds(1000);
+  escFR.writeMicroseconds(1000);
+  escBL.writeMicroseconds(1000);
+  escBR.writeMicroseconds(1000);
+  delay(3000);
+  
+  //Serial.println("ESCs Initialized - Waiting 3 seconds");
+  delay(3000); // Wait for ESC initialization beeps
+  //Serial.println("Ready for motor commands");
+}
+
+void setMotorSpeeds() {
+  unsigned long currentTime = millis();
+  
+  // Failsafe: Stop motors if no recent data
+  if (currentTime - lastValidPacket > FAILSAFE_TIMEOUT) {
+    escFL.writeMicroseconds(1000);
+    escFR.writeMicroseconds(1000);
+    escBL.writeMicroseconds(1000);
+    escBR.writeMicroseconds(1000);
+    return;
+  }
+  
+  // Convert 0-100% to 1000-1500 microseconds LIMIT TO NOT OVERLOAD
+  int fl_us = map(motorData.frontLeft, 0, 100, 1000, 1500);
+  int fr_us = map(motorData.frontRight, 0, 100, 1000, 1500);
+  int bl_us = map(motorData.backLeft, 0, 100, 1000, 1500);
+  int br_us = map(motorData.backRight, 0, 100, 1000, 1500);
+  
+  // Apply to ESCs
+  escFL.writeMicroseconds(fl_us);
+  escFR.writeMicroseconds(fr_us);
+  escBL.writeMicroseconds(bl_us);  
+  escBR.writeMicroseconds(br_us);
+  Serial.println(fl_us);
+  Serial.println(bl_us);
+  Serial.println(fr_us);
+  Serial.println(bl_us);
+}
+
+void flushSerialBuffer() {
+  while (Serial.available()) {
+    Serial.read();
+  }
+}
+
+bool readMotorPacket() {
+  static unsigned long startTime = 0;
+  static bool waitingForStart = true;
+  
+  if (waitingForStart) {
+    // Look for start marker '<'
+    while (Serial.available() > 0) {
+      if (Serial.read() == '<') {
+        startTime = millis();
+        waitingForStart = false;
+        break;
+      }
+    }
+    return false;
+  }
+  
+  // Check if complete packet is available
+  if (Serial.available() >= sizeof(Packet)) {
+    if (millis() - startTime > 50) { // Timeout waiting for complete packet
+      waitingForStart = true;
+      flushSerialBuffer();
+      return false;
+    }
+    
+    // Read the complete packet
+    Serial.readBytes((uint8_t*)&motorData, sizeof(Packet));
+
+    number = motorData.number;
+    
+    lastValidPacket = millis();
+    waitingForStart = true;
+    return true;
+  }
+  
+  // Timeout check for incomplete packets
+  if (millis() - startTime > 100) {
+    waitingForStart = true;
+    flushSerialBuffer();
+  }
+  
+  return false;
+}
+
+void setup() {
+
+  Serial.begin(250000);
+  //Serial.println("Initializing Drone Motor Controller...");
+  
+  // Initialize all motor commands to zero
+  motorData.frontLeft = 0;
+  motorData.frontRight = 0;
+  motorData.backLeft = 0;
+  motorData.backRight = 0;
+  
+  initializeESCs();
+  lastValidPacket = millis();
+  
+  //Serial.println("Motor Driver Ready - Waiting for commands from ESP8266");
+}
+
+void loop() {
+  // Check for new motor commands
+  if (readMotorPacket()) {
+    // Debug output (reduced frequency to avoid spam)
+    static unsigned long lastDebug = 0;
+    /*if (millis() - lastDebug > 1000) { // Every 1 second
+      Serial.print("Packet: ");
+      Serial.println(number);
+      Serial.println("Motors:");
+      Serial.print(" FL=");
+      Serial.print(motorData.frontLeft);
+      Serial.print(" FR=");
+      Serial.println(motorData.frontRight);
+      Serial.print(" BL=");
+      Serial.print(motorData.backLeft);
+      Serial.print(" BR=");
+      Serial.println(motorData.backRight);
+      lastDebug = millis();
+    }*/
+  }
+  
+  // Always update motor speeds (includes failsafe check)
+  setMotorSpeeds();
+  
+  // Fast loop for responsive motor control
+  delay(5); // 200Hz motor update rate
+}
